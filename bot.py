@@ -29,6 +29,17 @@ OONI_CACHE_TTL = int(os.environ.get("OONI_CACHE_TTL", "3600"))  # cache 1 jam
 # DNS resolver internasional untuk fallback check
 CLEAN_DNS = ["8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1"]
 
+# DNS resolver Indonesia — untuk deteksi blokir dari luar Indonesia
+INDONESIAN_DNS = [
+    "202.51.8.8",      # Telkom
+    "202.51.8.9",      # Telkom
+    "202.134.0.10",    # Biznet
+    "202.152.0.10",    # CBN
+    "203.142.82.2",    # Indosat
+    "202.9.77.10",     # XL
+    "202.46.130.13",   # Astinet
+]
+
 # IP range milik TRUI / Kominfo yang biasa dipakai untuk halaman blokir
 BLOCKED_IP_PATTERNS = [
     "103.77.208.",   # TRUI / Kominfo block page
@@ -363,17 +374,72 @@ def dns_check(domain: str) -> dict:
     return result
 
 
-# ─── Combined Check ─────────────────────────────────────────────────────────
-def check_block(domain: str, use_dns: bool = False) -> dict:
+# ─── DNS Indonesia Check (from foreign server) ───────────────────────────────
+def dns_indonesia_check(domain: str) -> dict | None:
     """
-    Cek blokir gabungan: OONI API (primary) + DNS (optional).
+    Resolve DNS via Indonesian DNS servers from foreign host (Railway).
+    Returns None if Indonesian DNS servers are not reachable.
+    """
+    indo_ips = []
+    for ns in INDONESIAN_DNS[:4]:
+        indo_ips = resolve_dns(domain, [ns])
+        if indo_ips:
+            break
+    
+    # Jika DNS Indonesia tidak reachable, return None
+    if not indo_ips:
+        return None
+    
+    clean_ips = resolve_dns(domain, CLEAN_DNS[:2])
+    
+    result = {
+        "blocked": False,
+        "indo_ips": indo_ips,
+        "clean_ips": clean_ips,
+        "reason": "",
+    }
+    
+    if not clean_ips:
+        result["reason"] = "DNS Indonesia berhasil, internasional gagal → tidak bisa bandingkan"
+        return result
+    
+    # Cek IP Indonesia apakah masuk block page
+    for ip in indo_ips:
+        if is_blocked_ip(ip):
+            result["blocked"] = True
+            result["reason"] = f"DNS Indonesia resolve ke block page: {ip}"
+            return result
+    
+    # Bandingkan IP
+    if set(indo_ips) != set(clean_ips):
+        result["blocked"] = True
+        result["reason"] = (
+            f"DNS poisoning terdeteksi! "
+            f"Indonesia: {', '.join(indo_ips[:3])} | "
+            f"International: {', '.join(clean_ips[:3])}"
+        )
+        return result
+    
+    result["reason"] = "DNS Indonesia dan internasional sama → tidak diblokir"
+    return result
+
+
+# ─── Combined Check ─────────────────────────────────────────────────────────
+def check_block(domain: str) -> dict:
+    """
+    Cek blokir 3-layer:
+    1. OONI API (data dari ISP Indonesia)
+    2. DNS Indonesia check (resolve via DNS Indonesia dari server luar)
+    3. HTTP check (cek redirect ke block page / kata kunci blokir)
     """
     result = {
         "domain": domain,
         "ooni": None,
         "dns": None,
+        "http": None,
         "blocked": False,
         "reason": "",
+        "method": "",
     }
     
     # 1. Cek via OONI API
@@ -382,19 +448,28 @@ def check_block(domain: str, use_dns: bool = False) -> dict:
     
     if ooni_result["found"]:
         result["blocked"] = ooni_result["blocked"]
-        result["reason"] = f"[OONI] {ooni_result['reason']}"
+        result["reason"] = ooni_result["reason"]
+        result["method"] = "OONI"
         return result
     
-    # 2. Fallback ke DNS jika OONI tidak punya data
-    if use_dns:
-        dns_result = dns_check(domain)
-        result["dns"] = dns_result
-        result["blocked"] = dns_result["blocked"]
-        result["reason"] = f"[DNS] {dns_result['reason']}"
+    # 2. Cek via DNS Indonesia
+    dns_result = dns_indonesia_check(domain)
+    result["dns"] = dns_result
+    
+    if dns_result and dns_result["blocked"]:
+        result["blocked"] = True
+        result["reason"] = dns_result["reason"]
+        result["method"] = "DNS"
         return result
     
-    # 3. Tidak ada data
-    result["reason"] = "Tidak ada data OONI. Coba aktifkan DNS check atau cek manual."
+    # 3. Cek via HTTP
+    http_result = http_check(domain)
+    result["http"] = http_result
+    
+    result["blocked"] = http_result["blocked"]
+    result["reason"] = http_result["reason"]
+    result["method"] = "HTTP"
+    
     return result
 
 
@@ -525,28 +600,14 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = raw.strip()
     added = add_link(update.effective_chat.id, link)
     if added:
-        ooni_result = ooni_check(domain)
-        http_result = None
-        if not ooni_result["found"]:
-            http_result = http_check(domain)
-        
-        blocked = ooni_result["blocked"] or (http_result["blocked"] if http_result else False)
-        status_icon = "🔴" if blocked else "🟢"
-        
-        source = "OONI" if ooni_result["found"] else ("HTTP" if http_result else "Tidak ada data")
-        detail = ""
-        if ooni_result["found"]:
-            detail = ooni_result['reason']
-        elif http_result:
-            detail = http_result['reason']
-        else:
-            detail = ooni_result['reason']
+        result = check_block(domain)
+        status_icon = "🔴" if result["blocked"] else "🟢"
         
         await update.message.reply_text(
             f"✅ Link ditambahkan!\n\n"
             f"{status_icon} `{domain}`\n"
-            f"Status: {detail}\n"
-            f"Source: {source}",
+            f"Status: {result['reason']}\n"
+            f"Metode: {result['method']}",
             parse_mode="Markdown",
         )
     else:
@@ -590,39 +651,37 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(f"🔍 Mengecek `{domain}`...", parse_mode="Markdown")
-    ooni_result = ooni_check(domain)
-    http_result = None
+    result = check_block(domain)
     
-    # Fallback ke HTTP check jika OONI tidak punya data
-    if not ooni_result["found"]:
-        http_result = http_check(domain)
-    
-    # Tentukan status akhir
-    blocked = ooni_result["blocked"] or (http_result["blocked"] if http_result else False)
-    status_icon = "🔴 DIBLOKIR" if blocked else "🟢 AMAN"
+    status_icon = "🔴 DIBLOKIR" if result["blocked"] else "🟢 AMAN"
     
     text = (
         f"📊 *Hasil Cek*\n\n"
         f"🌐 Domain: `{domain}`\n"
         f"Status: {status_icon}\n"
+        f"Metode: {result['method']}\n"
+        f"📝 {result['reason']}\n"
     )
     
-    # Detail dari OONI
-    if ooni_result["found"]:
+    # Detail tambahan
+    if result["ooni"] and result["ooni"]["found"]:
         text += (
-            f"\n📡 *OONI:*\n"
-            f"📝 {ooni_result['reason']}\n"
-            f"📏 Pengukuran: {ooni_result['measurement_count']}\n"
-            f"🕐 Terbaru: {ooni_result['latest_measurement']}\n"
+            f"\n📡 *OONI Details:*\n"
+            f"📏 Pengukuran: {result['ooni']['measurement_count']}\n"
+            f"🕐 Terbaru: {result['ooni']['latest_measurement']}\n"
         )
-    elif ooni_result["reason"] and "rate limit" not in ooni_result["reason"].lower():
-        text += f"\n📡 *OONI:* {ooni_result['reason']}\n"
     
-    # Detail dari HTTP
-    if http_result:
+    if result["dns"]:
+        text += (
+            f"\n🌍 *DNS Indonesia:*\n"
+            f"📍 IP Indo: {', '.join(result['dns']['indo_ips'][:3]) or 'gagal'}\n"
+            f"🌐 IP Clean: {', '.join(result['dns']['clean_ips'][:3]) or 'gagal'}\n"
+        )
+    
+    if result["http"]:
         text += (
             f"\n🌐 *HTTP Check:*\n"
-            f"📝 {http_result['reason']}\n"
+            f"📝 {result['http']['reason']}\n"
         )
     
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -645,40 +704,31 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not domain:
             continue
         
-        ooni_result = ooni_check(domain)
-        http_result = None
+        result = check_block(domain)
         
-        if not ooni_result["found"]:
-            http_result = http_check(domain)
-        
-        is_blocked = ooni_result["blocked"] or (http_result["blocked"] if http_result else False)
-        is_found = ooni_result["found"] or (http_result is not None)
-        
-        if is_blocked:
-            blocked.append((link, ooni_result, http_result))
-        elif is_found:
-            clean.append(link)
+        if result["blocked"]:
+            blocked.append((link, result))
+        elif result["method"] != "HTTP" or not result["http"] or result["http"]["status_code"]:
+            clean.append((link, result))
         else:
-            no_data.append(link)
+            no_data.append((link, result))
 
     text = "📊 *Hasil Cek Manual*\n\n"
     if blocked:
         text += "🔴 *DIBLOKIR:*\n"
-        for link, ooni, http in blocked:
+        for link, result in blocked:
             text += f"• `{link}`\n"
-            if ooni["found"]:
-                text += f"  📡 OONI: {ooni['reason']}\n"
-            if http:
-                text += f"  🌐 HTTP: {http['reason']}\n"
+            text += f"  📝 {result['reason'][:60]}\n"
+            text += f"  🔧 Metode: {result['method']}\n"
         text += "\n"
     if clean:
         text += "🟢 *AMAN:*\n"
-        for link in clean:
-            text += f"• `{link}`\n"
+        for link, result in clean:
+            text += f"• `{link}` ({result['method']})\n"
         text += "\n"
     if no_data:
         text += "⚪ *TIDAK ADA DATA:*\n"
-        for link in no_data:
+        for link, result in no_data:
             text += f"• `{link}`\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
