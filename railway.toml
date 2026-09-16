@@ -1,0 +1,13 @@
+# Railway configuration
+[build]
+  builder = "nixpacks"
+
+[deploy]
+  startCommand = "python bot.py"
+  healthcheckPath = "/ping"
+  healthcheckTimeout = 300
+  restartPolicyType = "on_failure"
+  restartPolicyMaxRetries = 10
+
+[service]
+  internalPort = 8080
