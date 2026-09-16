@@ -56,6 +56,40 @@ OONI_API_BASE = "https://api.ooni.io/api/v1"
 # Cache untuk hasil OONI (dengan TTL)
 _ooni_cache: dict[str, dict] = {}  # domain -> {"result": ..., "timestamp": ...}
 
+# Domain block page Kominfo/TRUI yang sering muncul saat redirect
+BLOCKED_DOMAINS = [
+    "lamanlabuh.aduankonten.id",
+    "trustpositif.kominfo.go.id",
+    "aduankonten.id",
+    "blockpage.id",
+    "internetpositif.id",
+    "positif.id",
+    "stopjudol.id",
+    "blokir.id",
+]
+
+# Kata-kata yang sering muncul di halaman blokir
+BLOCKED_KEYWORDS = [
+    "trustpositif",
+    "internet positif",
+    "internetpositif",
+    "lamanlabuh",
+    "aduankonten",
+    "diblokir",
+    "di blokir",
+    "blokir",
+    "block page",
+    "blocked",
+    "kementerian komunikasi",
+    "kominfo",
+    "positivity",
+    "negatif",
+    "kasus pelanggaran",
+    "pelanggaran",
+    "laporan",
+    "pengaduan",
+]
+
 
 def ooni_check(domain: str) -> dict:
     """
@@ -165,6 +199,98 @@ def ooni_check(domain: str) -> dict:
     
     # Simpan ke cache
     _ooni_cache[domain] = {"result": result, "timestamp": now}
+    
+    return result
+
+
+# ─── HTTP Check (Fallback) ──────────────────────────────────────────────────
+def http_check(domain: str) -> dict:
+    """
+    Cek blokir via HTTP request langsung.
+    Catatan: Bot jalan dari server luar Indonesia (Railway), jadi request tidak
+    akan diblokir ISP Indonesia. Fungsi ini untuk verifikasi tambahan dan
+    mendeteksi redirect ke block page jika ada.
+    """
+    url = f"https://{domain}" if not domain.startswith(("http://", "https://")) else domain
+    
+    result = {
+        "blocked": False,
+        "status_code": None,
+        "final_url": None,
+        "reason": "",
+        "response_time_ms": None,
+    }
+    
+    try:
+        start = time.time()
+        resp = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+        )
+        elapsed = (time.time() - start) * 1000
+        result["response_time_ms"] = round(elapsed, 1)
+        result["status_code"] = resp.status_code
+        result["final_url"] = str(resp.url)
+        
+        # Cek apakah redirect ke domain block page
+        final_host = urlparse(str(resp.url)).hostname or ""
+        if any(blocked in final_host for blocked in BLOCKED_DOMAINS):
+            result["blocked"] = True
+            result["reason"] = f"Redirect ke block page: {final_host}"
+            return result
+        
+        # Cek apakah URL asli mengandung domain block page
+        original_host = urlparse(url).hostname or ""
+        if any(blocked in original_host for blocked in BLOCKED_DOMAINS):
+            result["blocked"] = True
+            result["reason"] = f"Domain block page: {original_host}"
+            return result
+        
+        # Analisis body content
+        body = resp.text.lower() if resp.text else ""
+        if body:
+            # Cek kata-kata blokir di body
+            found_keywords = [kw for kw in BLOCKED_KEYWORDS if kw.lower() in body]
+            if found_keywords:
+                result["blocked"] = True
+                result["reason"] = f"Kata kunci blokir ditemukan di halaman: {', '.join(found_keywords[:3])}"
+                return result
+            
+            # Cek title page
+            title_match = re.search(r'<title>(.*?)</title>', body, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = title_match.group(1).lower()
+                if any(kw in title for kw in BLOCKED_KEYWORDS):
+                    result["blocked"] = True
+                    result["reason"] = f"Title halaman mengandung kata blokir: {title_match.group(1)[:50]}"
+                    return result
+        
+        # Response sukses
+        if resp.status_code == 200:
+            result["reason"] = f"HTTP 200 OK (response time: {result['response_time_ms']}ms)"
+        elif 300 <= resp.status_code < 400:
+            result["reason"] = f"HTTP {resp.status_code} redirect ke: {final_host}"
+        elif resp.status_code == 403:
+            result["reason"] = f"HTTP 403 Forbidden — mungkin diblokir atau akses ditolak"
+        elif resp.status_code == 404:
+            result["reason"] = f"HTTP 404 Not Found — halaman tidak ditemukan"
+        elif resp.status_code >= 500:
+            result["reason"] = f"HTTP {resp.status_code} server error"
+        else:
+            result["reason"] = f"HTTP {resp.status_code}"
+            
+    except httpx.TimeoutException:
+        result["reason"] = "HTTP timeout — server tidak merespon dalam 15 detik"
+    except httpx.ConnectError as e:
+        result["reason"] = f"HTTP connection error: {str(e)[:80]}"
+    except Exception as e:
+        result["reason"] = f"HTTP error: {str(e)[:80]}"
     
     return result
 
@@ -399,13 +525,27 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = raw.strip()
     added = add_link(update.effective_chat.id, link)
     if added:
-        result = ooni_check(domain)
-        status_icon = "🔴" if result["blocked"] else "🟢"
-        source = "OONI" if result["found"] else "Tidak ada data"
+        ooni_result = ooni_check(domain)
+        http_result = None
+        if not ooni_result["found"]:
+            http_result = http_check(domain)
+        
+        blocked = ooni_result["blocked"] or (http_result["blocked"] if http_result else False)
+        status_icon = "🔴" if blocked else "🟢"
+        
+        source = "OONI" if ooni_result["found"] else ("HTTP" if http_result else "Tidak ada data")
+        detail = ""
+        if ooni_result["found"]:
+            detail = ooni_result['reason']
+        elif http_result:
+            detail = http_result['reason']
+        else:
+            detail = ooni_result['reason']
+        
         await update.message.reply_text(
             f"✅ Link ditambahkan!\n\n"
             f"{status_icon} `{domain}`\n"
-            f"Status: {result['reason']}\n"
+            f"Status: {detail}\n"
             f"Source: {source}",
             parse_mode="Markdown",
         )
@@ -449,20 +589,40 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ URL tidak valid.")
         return
 
-    await update.message.reply_text(f"🔍 Mengecek `{domain}` via OONI...", parse_mode="Markdown")
-    result = ooni_check(domain)
-
-    status_icon = "🔴 DIBLOKIR" if result["blocked"] else "🟢 AMAN"
+    await update.message.reply_text(f"🔍 Mengecek `{domain}`...", parse_mode="Markdown")
+    ooni_result = ooni_check(domain)
+    http_result = None
+    
+    # Fallback ke HTTP check jika OONI tidak punya data
+    if not ooni_result["found"]:
+        http_result = http_check(domain)
+    
+    # Tentukan status akhir
+    blocked = ooni_result["blocked"] or (http_result["blocked"] if http_result else False)
+    status_icon = "🔴 DIBLOKIR" if blocked else "🟢 AMAN"
+    
     text = (
-        f"📊 *Hasil Cek OONI*\n\n"
+        f"📊 *Hasil Cek*\n\n"
         f"🌐 Domain: `{domain}`\n"
         f"Status: {status_icon}\n"
-        f"📝 Alasan: {result['reason']}\n"
     )
-    if result["found"]:
+    
+    # Detail dari OONI
+    if ooni_result["found"]:
         text += (
-            f"📏 Pengukuran: {result['measurement_count']}\n"
-            f"🕐 Terbaru: {result['latest_measurement']}\n"
+            f"\n📡 *OONI:*\n"
+            f"📝 {ooni_result['reason']}\n"
+            f"📏 Pengukuran: {ooni_result['measurement_count']}\n"
+            f"🕐 Terbaru: {ooni_result['latest_measurement']}\n"
+        )
+    elif ooni_result["reason"] and "rate limit" not in ooni_result["reason"].lower():
+        text += f"\n📡 *OONI:* {ooni_result['reason']}\n"
+    
+    # Detail dari HTTP
+    if http_result:
+        text += (
+            f"\n🌐 *HTTP Check:*\n"
+            f"📝 {http_result['reason']}\n"
         )
     
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -484,19 +644,32 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         domain = extract_domain(link)
         if not domain:
             continue
-        result = ooni_check(domain)
-        if not result["found"]:
-            no_data.append(link)
-        elif result["blocked"]:
-            blocked.append((link, result))
-        else:
+        
+        ooni_result = ooni_check(domain)
+        http_result = None
+        
+        if not ooni_result["found"]:
+            http_result = http_check(domain)
+        
+        is_blocked = ooni_result["blocked"] or (http_result["blocked"] if http_result else False)
+        is_found = ooni_result["found"] or (http_result is not None)
+        
+        if is_blocked:
+            blocked.append((link, ooni_result, http_result))
+        elif is_found:
             clean.append(link)
+        else:
+            no_data.append(link)
 
     text = "📊 *Hasil Cek Manual*\n\n"
     if blocked:
         text += "🔴 *DIBLOKIR:*\n"
-        for link, res in blocked:
-            text += f"• `{link}` — {res['reason']}\n"
+        for link, ooni, http in blocked:
+            text += f"• `{link}`\n"
+            if ooni["found"]:
+                text += f"  📡 OONI: {ooni['reason']}\n"
+            if http:
+                text += f"  🌐 HTTP: {http['reason']}\n"
         text += "\n"
     if clean:
         text += "🟢 *AMAN:*\n"
