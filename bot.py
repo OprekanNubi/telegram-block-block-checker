@@ -693,7 +693,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Belum ada link yang dipantau.", parse_mode="Markdown")
         return
 
-    await update.message.reply_text(f"🔍 Mengecek {len(links)} link via OONI...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 Mengecek {len(links)} link...", parse_mode="Markdown")
 
     blocked = []
     clean = []
